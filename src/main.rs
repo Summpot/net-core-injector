@@ -1,11 +1,15 @@
 use std::ffi::{c_char, c_uint, c_void, CStr, CString};
 use std::fs;
+use std::mem::transmute;
 use std::os::raw::c_int;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use frida::Session;
 use libloading::{Library, Symbol};
+use netcorehost::hostfxr::Hostfxr;
+use netcorehost::nethost;
+use netcorehost::pdcstring::PdCStr;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -71,71 +75,18 @@ pub unsafe extern "C" fn bootstrapper_load_assembly(
     type_name: *const c_char,
     method_name: *const c_char,
 ) -> Result<(), InitializeError> {
-    #[cfg(windows)]
-    let library_name = String::from("hostfxr.dll");
-    #[cfg(unix)]
-    let library_name = String::from("libhostfxr.so");
-    let library = libloading::Library::new(library_name)?;
-
-    let hostfxr_initialize_for_runtime_config_fptr: libloading::Symbol<
-        HostfxrInitializeForRuntimeConfigFn,
-    > = library
-        .get(b"hostfxr_initialize_for_runtime_config")
-        .map_err(|_| InitializeError::EntryPointError)?;
-
-    let hostfxr_get_runtime_delegate_fptr: libloading::Symbol<HostfxrGetRuntimeDelegateFn> =
-        library
-            .get(b"hostfxr_get_runtime_delegate")
-            .map_err(|_| InitializeError::EntryPointError)?;
-
-    let hostfxr_close_fptr: libloading::Symbol<HostfxrCloseFn> = library
-        .get(b"hostfxr_close")
-        .map_err(|_| InitializeError::EntryPointError)?;
-
-    let mut ctx: HostfxrHandle = std::ptr::null_mut();
-    let rc =
-        hostfxr_initialize_for_runtime_config_fptr(runtime_config_path, std::ptr::null(), &mut ctx);
-
-    if rc != 1 || ctx.is_null() {
-        hostfxr_close_fptr(ctx);
-        return Err(InitializeError::InitializeRuntimeConfigError);
-    }
-
-    let mut delegate: *mut c_void = std::ptr::null_mut();
-    let ret = hostfxr_get_runtime_delegate_fptr(
-        ctx,
-        HostfxrDelegateType::HdtLoadAssemblyAndGetFunctionPointer,
-        &mut delegate,
-    );
-
-    if ret != 0 || delegate.is_null() {
-        return Err(InitializeError::InitializeRuntimeConfigError);
-    }
-
-    let load_assembly_fptr: LoadAssemblyAndGetFunctionPointerFn =
-        std::mem::transmute_copy(&delegate);
-
-    type CustomEntryPointFn = unsafe extern "C" fn();
-    let mut custom: *mut c_void = std::ptr::null_mut();
-
-    let ret = load_assembly_fptr(
-        assembly_path,
-        type_name,
-        method_name,
-        UNMANAGEDCALLERSONLY_METHOD,
-        std::ptr::null(),
-        &mut custom,
-    );
-
-    if ret != 0 || custom.is_null() {
-        return Err(InitializeError::EntryPointError);
-    }
-
-    let custom_fn: CustomEntryPointFn = std::mem::transmute_copy(&custom);
-    custom_fn();
-
-    hostfxr_close_fptr(ctx);
-
+    let hostfxr = nethost::load_hostfxr()?;
+    let context = hostfxr
+        .initialize_for_runtime_config(PdCStr::from_str_ptr(runtime_config_path as *const u16))?;
+    let fn_loader = context
+        .get_delegate_loader_for_assembly(PdCStr::from_str_ptr(assembly_path as *const u16))
+        .unwrap();
+    let hello = fn_loader
+        .get_function_with_unmanaged_callers_only::<fn()>(
+            PdCStr::from_str_ptr(transmute(type_name)),
+            PdCStr::from_str_ptr(transmute(method_name)),
+        )
+        .unwrap();
     Ok(())
 }
 
@@ -206,7 +157,7 @@ async fn run_inject(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         type_name,
         method_name,
     } = args
-    {   
+    {
         let session = Session::attach(process_name).await?;
 
         let source = fs::read_to_string("dist/agent.js")?;
