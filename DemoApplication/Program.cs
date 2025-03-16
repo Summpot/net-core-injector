@@ -5,7 +5,7 @@ namespace DemoApplication
         static void Main()
         {
             int i = 0;
-            while (i < 30)
+            while (i < 60000)
             {
                 F(i++);
                 Thread.Sleep(1000);
